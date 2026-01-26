@@ -146,7 +146,7 @@ If provided, call CALLBACK with ARGS afterwards."
 ;; (defvar w-all-entries nil)
 ;; (defvar w-local-ids nil)
 ;;----------------8<-------------------
-(cl-defun w-sync (&key since page num-total local-ids full)
+(cl-defun w-sync (&key since page num-total max-id full)
   "Synchronize the local Wombag database.
 
 This will update the local state of Wombag to that the server:
@@ -176,7 +176,8 @@ The remaining keywords are for internal use only
 
 PAGE: Page number of entries.
 NUM-TOTAL: Running total of new entries
-LOCAL-IDS: Ids from SINCE available locally."
+MAX-ID: Lowest ID from previous page of entries to serve as upper
+bound for IDs on current page"
   (interactive
    (list :since
          (when (= (prefix-numeric-value current-prefix-arg) 4)
@@ -217,15 +218,25 @@ LOCAL-IDS: Ids from SINCE available locally."
     (cl-function
      (lambda (&key data &allow-other-keys)
        "Update Wombag db if necessary"
-       (let ((num-new)
-             (all-entries (map-nested-elt data '(_embedded items)))
-             (local-ids (or local-ids
-                            (apply #'nconc
-                                   (w-db-query
-                                    `[:select id :from items
-                                      :where (>= updated_at ;created_at
-                                              ,(format-time-string "%Y-%m-%dT%H:%M:%S" since t))
-                                      :order-by (desc id)])))))
+       (let* ((num-new)
+              (all-entries (map-nested-elt data '(_embedded items)))
+              (server-ids (mapcar (lambda (e) (map-elt e 'id)) all-entries))
+              (min-id (when server-ids (apply #'min server-ids)))
+              (local-ids (apply #'nconc
+                                (w-db-query
+                                 `[:select id :from items
+                                   :where
+                                   (or
+                                    ;; To determine inserts vs updates:
+                                    (in id ,(vconcat server-ids))
+                                    ;; To determine deletes: run same query as
+                                    ;; server, by ID range for the page. Local
+                                    ;; IDs not on the server should be deleted.
+                                    (and (>= updated_at
+                                             ,(format-time-string "%Y-%m-%dT%H:%M:%S" since t))
+                                         (>= id ,(or min-id 0))
+                                         (<  id ,(or max-id most-positive-fixnum))))
+                                   :order-by (desc id)]))))
          ;;----------------8<-------------------
          ;; (setq w-all-entries
          ;;       (nconc w-all-entries all-entries))
@@ -233,10 +244,9 @@ LOCAL-IDS: Ids from SINCE available locally."
          ;;       (nconc w-local-ids local-ids))
          ;;----------------8<-------------------
          (if local-ids
-             (let ((server-ids))
+             (progn
                (cl-loop for entry across all-entries
                         for id = (map-elt entry 'id)
-                        do (push id server-ids)
                         if (memq id local-ids)
                         collect entry into updated-entries
                         else collect entry into new-entries
@@ -257,7 +267,7 @@ LOCAL-IDS: Ids from SINCE available locally."
               :page (1+ (or page 1))
               :since since
               :num-total (+ num-new num-total)
-              :local-ids local-ids
+              :max-id min-id
               :full full)
            (w-db-update-date (float-time))
            (when full (w--sweep-deleted-entries)))
